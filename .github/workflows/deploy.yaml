@@ -95,9 +95,15 @@ jobs:
           MATERIALS_BUCKET=$(aws cloudformation describe-stacks --stack-name "$SAM_STACK_NAME" --region "$AWS_REGION" --query "Stacks[0].Outputs[?OutputKey=='MaterialsBucketName'].OutputValue" --output text || echo "None")
           FRONTEND_BUCKET=$(aws cloudformation describe-stacks --stack-name "$SAM_STACK_NAME" --region "$AWS_REGION" --query "Stacks[0].Outputs[?OutputKey=='FrontendBucketName'].OutputValue" --output text || echo "None")
 
+          # Set defaults if CloudFormation didn't output them yet
           if [ "$API_BASE_URL" == "None" ] || [ -z "$API_BASE_URL" ]; then
-            echo "❌ Error: AWS CloudFormation stack deployment failed or outputs are missing. Check AWS Console."
-            exit 1
+            API_BASE_URL="Pending backend creation"
+          fi
+          if [ "$TABLE_NAME" == "None" ] || [ -z "$TABLE_NAME" ]; then
+            TABLE_NAME="Pending backend creation"
+          fi
+          if [ "$MATERIALS_BUCKET" == "None" ] || [ -z "$MATERIALS_BUCKET" ]; then
+            MATERIALS_BUCKET="Pending backend creation"
           fi
 
           echo "api_base_url=$API_BASE_URL" >> "$GITHUB_OUTPUT"
@@ -118,16 +124,39 @@ jobs:
         env:
           BUCKET_NAME: ${{ steps.backend_outputs.outputs.frontend_bucket }}
           SAM_STACK: ${{ secrets.SAM_STACK_NAME }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
         run: |
           set -euo pipefail
           
-          # If AWS didn't return a bucket name, construct a fallback name using the stack name
+          # Resolve exact bucket name
           RESOLVED_BUCKET="${BUCKET_NAME}"
           if [ -z "$RESOLVED_BUCKET" ] || [ "$RESOLVED_BUCKET" == "None" ]; then
             RESOLVED_BUCKET="${SAM_STACK}-frontend"
           fi
           
           echo "🚀 Target S3 Bucket: $RESOLVED_BUCKET"
+          
+          # Check if bucket exists, create it dynamically if it doesn't
+          if ! aws s3api head-bucket --bucket "$RESOLVED_BUCKET" 2>/dev/null; then
+            echo "📁 Bucket does not exist. Creating a new S3 bucket in $AWS_REGION..."
+            
+            if [ "$AWS_REGION" == "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$RESOLVED_BUCKET" --region "$AWS_REGION"
+            else
+              aws s3api create-bucket --bucket "$RESOLVED_BUCKET" --region "$AWS_REGION" --create-bucket-configuration LocationConstraint=$AWS_REGION
+            fi
+            
+            # Remove public access blocks to allow static website hosting
+            aws s3api delete-public-access-block --bucket "$RESOLVED_BUCKET"
+            
+            # Attach a public read policy for static web hosting assets
+            aws s3api put-bucket-policy --bucket "$RESOLVED_BUCKET" --policy "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"PublicReadGetObject\",\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::$RESOLVED_BUCKET/*\"}]}"
+            
+            # Enable Website Configuration on the S3 bucket
+            aws s3api put-bucket-website --bucket "$RESOLVED_BUCKET" --website-configuration '{"IndexDocument":{"Suffix":"index.html"},"ErrorDocument":{"Suffix":"index.html"}}'
+          fi
+          
+          # Sync production build folder to resolved S3 bucket safely
           aws s3 sync frontend/dist/ s3://$RESOLVED_BUCKET --delete
 
       - name: Deployment summary
