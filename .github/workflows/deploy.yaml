@@ -1,0 +1,145 @@
+name: Deploy CloudMentor Serverless Production
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy Serverless Backend & Frontend Assets
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Set up AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+
+      - name: Validate required secrets
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          SAM_STACK_NAME: ${{ secrets.SAM_STACK_NAME }}
+          AI_MODE: ${{ secrets.AI_MODE }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          : "${AWS_REGION:?Missing AWS_REGION secret}"
+          : "${SAM_STACK_NAME:?Missing SAM_STACK_NAME secret}"
+
+          MODE="${AI_MODE:-openai}"
+          if [ "$MODE" != "mock" ] && [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "OPENAI_API_KEY is required when AI_MODE is openai. Use AI_MODE=mock for demo deployment."
+            exit 1
+          fi
+
+      - name: Build and deploy backend with AWS SAM
+        working-directory: backend
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          SAM_STACK_NAME: ${{ secrets.SAM_STACK_NAME }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          AI_MODE: ${{ secrets.AI_MODE }}
+          CORS_ORIGIN: ${{ secrets.CORS_ORIGIN }}
+        run: |
+          set -euo pipefail
+          npm install --no-audit --no-fund
+          sam build
+
+          MODEL_VALUE="${OPENAI_MODEL:-gpt-4.1-mini}"
+          MODE_VALUE="${AI_MODE:-openai}"
+          KEY_VALUE="${OPENAI_API_KEY:-mock-placeholder-no-openai-key}"
+          CORS_VALUE="${CORS_ORIGIN:-*}" # Serverless allows flexible CORS, defaults to all if empty
+
+          sam deploy \
+            --stack-name "$SAM_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --capabilities CAPABILITY_IAM \
+            --resolve-s3 \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              OpenAiApiKey="$KEY_VALUE" \
+              OpenAiModel="$MODEL_VALUE" \
+              AiMode="$MODE_VALUE" \
+              CorsOrigin="$CORS_VALUE"
+
+      - name: Read backend outputs
+        id: backend_outputs
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          SAM_STACK_NAME: ${{ secrets.SAM_STACK_NAME }}
+        run: |
+          set -euo pipefail
+          API_BASE_URL=$(aws cloudformation describe-stacks \
+            --stack-name "$SAM_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiBaseUrl'].OutputValue" \
+            --output text)
+
+          TABLE_NAME=$(aws cloudformation describe-stacks \
+            --stack-name "$SAM_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs[?OutputKey=='TableName'].OutputValue" \
+            --output text)
+
+          MATERIALS_BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name "$SAM_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs[?OutputKey=='MaterialsBucketName'].OutputValue" \
+            --output text)
+
+          # Automatically resolve Frontend S3 Bucket Name from AWS SAM CloudFormation outputs
+          FRONTEND_BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name "$SAM_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs[?OutputKey=='FrontendBucketName'].OutputValue" \
+            --output text)
+
+          echo "api_base_url=$API_BASE_URL" >> "$GITHUB_OUTPUT"
+          echo "table_name=$TABLE_NAME" >> "$GITHUB_OUTPUT"
+          echo "materials_bucket=$MATERIALS_BUCKET" >> "$GITHUB_OUTPUT"
+          echo "frontend_bucket=$FRONTEND_BUCKET" >> "$GITHUB_OUTPUT"
+
+      - name: Build frontend for Serverless Hosting
+        working-directory: frontend
+        env:
+          VITE_API_BASE_URL: ${{ steps.backend_outputs.outputs.api_base_url }}
+        run: |
+          set -euo pipefail
+          npm install --no-audit --no-fund
+          npm run build
+
+      - name: Deploy Frontend Assets to AWS S3 (Serverless Web Hosting)
+        env:
+          BUCKET_NAME: ${{ steps.backend_outputs.outputs.frontend_bucket }}
+        run: |
+          set -euo pipefail
+          # Safely syncs static build directly to S3 without needing any virtual servers/EC2
+          aws s3 sync frontend/dist/ s3://$BUCKET_NAME --delete
+
+      - name: Deployment summary
+        run: |
+          echo "================ DEPLOYMENT SUCCESSFUL ================"
+          echo "CloudMentor Frontend S3 Bucket:  s3://${{ steps.backend_outputs.outputs.frontend_bucket }}"
+          echo "CloudMentor Backend Lambda API:  ${{ steps.backend_outputs.outputs.api_base_url }}"
+          echo "DynamoDB History Table:          ${{ steps.backend_outputs.outputs.table_name }}"
+          echo "Secure Materials S3 Bucket:      ${{ steps.backend_outputs.outputs.materials_bucket }}"
+          echo "======================================================="
