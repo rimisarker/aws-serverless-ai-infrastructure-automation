@@ -1,204 +1,33 @@
-AWSTemplateFormatVersion: '2010-09-09'
-Transform: AWS::Serverless-2016-10-31
-Description: CloudMentor - OpenAI + Lambda + API Gateway + DynamoDB + S3 uploads + Automated Amplify Frontend
+name: Deploy CloudMentor Multi-Folder Infrastructure
 
-Parameters:
-  GitHubRepoUrl:
-    Type: String
-    Description: 'Your GitHub repository URL'
-    Default: 'https://github.com/YOUR_USERNAME/YOUR_REPO_NAME'
-  GitHubBranch:
-    Type: String
-    Default: 'main'
-  GitHubTokenSecretName:
-    Type: String
-    Default: 'GitHubToken'
-  OpenAiApiKey:
-    Type: String
-    NoEcho: true
-    Default: mock-placeholder-no-openai-key
-  OpenAiModel:
-    Type: String
-    Default: gpt-4o-mini
-  AiMode:
-    Type: String
-    Default: openai
-    AllowedValues:
-      - openai
-      - mock
-  CorsOrigin:
-    Type: String
-    Default: '*'
+on:
+  push:
+    branches:
+      - main
 
-Globals:
-  Function:
-    Runtime: nodejs22.x
-    Architectures:
-      - arm64
-    Timeout: 30
-    MemorySize: 512
-    Tracing: Active
-    Environment:
-      Variables:
-        OPENAI_API_KEY: !Ref OpenAiApiKey
-        OPENAI_MODEL: !Ref OpenAiModel
-        AI_MODE: !Ref AiMode
-        TABLE_NAME: !Ref CloudMentorTable
-        MATERIALS_BUCKET: !Ref CloudMentorMaterialsBucket
-        CORS_ORIGIN: !Ref CorsOrigin
-        STORAGE_MODE: s3
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
 
-Resources:
-  # ---- AWS Amplify Frontend Sync ----
-  CloudMentorAmplifyApp:
-    Type: AWS::Amplify::App
-    Properties:
-      Name: !Sub '${AWS::StackName}-frontend'
-      Repository: !Ref GitHubRepoUrl
-      OauthToken: !Sub '{{resolve:secretsmanager:${GitHubTokenSecretName}:SecretString:token}}'
-      Description: 'Automated Frontend Sync with GitHub'
-      BuildSpec: |
-        version: 1
-        frontend:
-          phases:
-            preBuild:
-              # FIXED: Git root theke frontend folder-e giye build run korbe
-              commands:
-                - cd frontend
-                - npm install
-            build:
-              commands:
-                - npm run build
-          artifacts:
-            # FIXED: Base Directory path setup correctly
-            baseDirectory: frontend/dist
-            files:
-              - '**/*'
-          cache:
-            paths:
-              - frontend/node_modules/**/*
+      - name: Setup AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
 
-  CloudMentorAmplifyBranch:
-    Type: AWS::Amplify::Branch
-    Properties:
-      AppId: !GetAtt CloudMentorAmplifyApp.AppId
-      BranchName: !Ref GitHubBranch
-      EnableAutoBuild: true
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
 
-  # ---- API GATEWAY ----
-  CloudMentorHttpApi:
-    Type: AWS::Serverless::HttpApi
-    Properties:
-      StageName: '$default' 
-      CorsConfiguration:
-        AllowOrigins:
-          - !Ref CorsOrigin
-        AllowHeaders:
-          - Content-Type
-          - Authorization
-        AllowMethods:
-          - GET
-          - POST
-          - PUT
-          - OPTIONS
-        MaxAge: 600
+      - name: SAM Build
+        run: sam build --template-file backend/template.yaml
 
-  # ---- COMPUTE LAYER (Lambda Backend) ----
-  CloudMentorFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: ./src             # FIXED: Points directly to backend source folder
-      Handler: app.handler       # Points to app.mjs inside backend/src/
-      FunctionName: !Sub '${AWS::StackName}-api'
-      Policies:
-        - AWSLambdaBasicExecutionRole
-        - DynamoDBCrudPolicy:
-            TableName: !Ref CloudMentorTable
-        - S3CrudPolicy:
-            BucketName: !Ref CloudMentorMaterialsBucket
-      Events:
-        Health:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref CloudMentorHttpApi
-            Path: /health
-            Method: GET
-        UploadUrl:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref CloudMentorHttpApi
-            Path: /upload-url
-            Method: POST
-        ProcessFile:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref CloudMentorHttpApi
-            Path: /process-file
-            Method: POST
-        Summarize:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref CloudMentorHttpApi
-            Path: /summarize
-            Method: POST
-
-  CloudMentorFunctionLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-api'
-      RetentionInDays: 14
-
-  # ---- DATABASE LAYER (With Auto-Delete) ----
-  CloudMentorTable:
-    Type: AWS::DynamoDB::Table
-    DeletionPolicy: Delete       
-    UpdateReplacePolicy: Delete  
-    Properties:
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: userId
-          AttributeType: S
-        - AttributeName: recordId 
-          AttributeType: S
-      KeySchema:
-        - AttributeName: userId
-          KeyType: HASH
-        - AttributeName: recordId 
-          KeyType: RANGE
-      SSESpecification:
-        SSEEnabled: true
-
-  # ---- STORAGE LAYER (With Auto-Delete) ----
-  CloudMentorMaterialsBucket:
-    Type: AWS::S3::Bucket
-    DeletionPolicy: Delete       
-    UpdateReplacePolicy: Delete  
-    Properties:
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-      CorsConfiguration:
-        CorsRules:
-          - AllowedHeaders:
-              - '*'
-            AllowedMethods:
-              - PUT
-              - GET
-              - HEAD
-            AllowedOrigins:
-              - !Ref CorsOrigin
-            ExposedHeaders:
-              - ETag
-            MaxAge: 3000
-
-Outputs:
-  ApiBaseUrl:
-    Value: !Sub 'https://${CloudMentorHttpApi}.execute-api.${AWS::Region}.amazonaws.com'
-  TableName:
-    Value: !Ref CloudMentorTable
-  MaterialsBucketName:
-    Value: !Ref CloudMentorMaterialsBucket
-  AmplifyAppProductionUrl:
-    Value: !GetAtt CloudMentorAmplifyBranch.DomainName
+      - name: SAM Deploy
+        run: |
+          sam deploy --no-confirm-changeset --no-fail-on-empty-changeset \
+            --stack-name CloudMentorAutomatedStack \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --parameter-overrides GitHubRepoUrl="https://github.com/${{ github.repository }}" GitHubBranch="main"
