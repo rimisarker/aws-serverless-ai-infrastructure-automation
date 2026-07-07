@@ -1,28 +1,34 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: CloudMentor - OpenAI + Lambda + API Gateway + DynamoDB + S3 uploads
+Description: CloudMentor - OpenAI + Lambda + API Gateway + DynamoDB + S3 uploads + Automated Amplify Frontend
 
 Parameters:
+  GitHubRepoUrl:
+    Type: String
+    Description: 'Your GitHub repository URL'
+    Default: 'https://github.com/YOUR_USERNAME/YOUR_REPO_NAME'
+  GitHubBranch:
+    Type: String
+    Default: 'main'
+  GitHubTokenSecretName:
+    Type: String
+    Default: 'GitHubToken'
   OpenAiApiKey:
     Type: String
     NoEcho: true
     Default: mock-placeholder-no-openai-key
-    Description: OpenAI API key. Use a real key for AiMode=openai. For AiMode=mock, the placeholder is ignored.
   OpenAiModel:
     Type: String
-    Default: gpt-4.1-mini
-    Description: OpenAI text model to use.
+    Default: gpt-4o-mini
   AiMode:
     Type: String
     Default: openai
     AllowedValues:
       - openai
       - mock
-    Description: Use openai for real AI calls or mock for classroom demos without API billing.
   CorsOrigin:
     Type: String
     Default: '*'
-    Description: Allowed frontend origin. Use * for classroom demo only.
 
 Globals:
   Function:
@@ -43,19 +49,53 @@ Globals:
         STORAGE_MODE: s3
 
 Resources:
+  # ---- AWS Amplify Frontend Sync ----
+  CloudMentorAmplifyApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: !Sub '${AWS::StackName}-frontend'
+      Repository: !Ref GitHubRepoUrl
+      OauthToken: !Sub '{{resolve:secretsmanager:${GitHubTokenSecretName}:SecretString:token}}'
+      Description: 'Automated Frontend Sync with GitHub'
+      BuildSpec: |
+        version: 1
+        frontend:
+          phases:
+            preBuild:
+              # FIXED: Git root theke frontend folder-e giye build run korbe
+              commands:
+                - cd frontend
+                - npm install
+            build:
+              commands:
+                - npm run build
+          artifacts:
+            # FIXED: Base Directory path setup correctly
+            baseDirectory: frontend/dist
+            files:
+              - '**/*'
+          cache:
+            paths:
+              - frontend/node_modules/**/*
+
+  CloudMentorAmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      AppId: !GetAtt CloudMentorAmplifyApp.AppId
+      BranchName: !Ref GitHubBranch
+      EnableAutoBuild: true
+
+  # ---- API GATEWAY ----
   CloudMentorHttpApi:
     Type: AWS::Serverless::HttpApi
     Properties:
-      StageName: '$default' # Ensures clean custom staging without appending /Prod/ to your URLs
+      StageName: '$default' 
       CorsConfiguration:
         AllowOrigins:
           - !Ref CorsOrigin
         AllowHeaders:
           - Content-Type
           - Authorization
-          - x-amz-date
-          - x-amz-security-token
-          - x-amz-content-sha256
         AllowMethods:
           - GET
           - POST
@@ -63,13 +103,13 @@ Resources:
           - OPTIONS
         MaxAge: 600
 
+  # ---- COMPUTE LAYER (Lambda Backend) ----
   CloudMentorFunction:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: .
-      Handler: src/app.handler
+      CodeUri: ./src             # FIXED: Points directly to backend source folder
+      Handler: app.handler       # Points to app.mjs inside backend/src/
       FunctionName: !Sub '${AWS::StackName}-api'
-      Description: CloudMentor Lambda API
       Policies:
         - AWSLambdaBasicExecutionRole
         - DynamoDBCrudPolicy:
@@ -95,47 +135,11 @@ Resources:
             ApiId: !Ref CloudMentorHttpApi
             Path: /process-file
             Method: POST
-        LocalUpload:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref CloudMentorHttpApi
-            Path: /local-upload/{proxy+}
-            Method: PUT
         Summarize:
           Type: HttpApi
           Properties:
             ApiId: !Ref CloudMentorHttpApi
             Path: /summarize
-            Method: POST
-        Quiz:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref CloudMentorHttpApi
-            Path: /quiz
-            Method: POST
-        Flashcards:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref CloudMentorHttpApi
-            Path: /flashcards
-            Method: POST
-        StudyPlan:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref CloudMentorHttpApi
-            Path: /study-plan
-            Method: POST
-        History:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref CloudMentorHttpApi
-            Path: /history
-            Method: GET
-        Progress:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref CloudMentorHttpApi
-            Path: /save-progress
             Method: POST
 
   CloudMentorFunctionLogGroup:
@@ -144,40 +148,37 @@ Resources:
       LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-api'
       RetentionInDays: 14
 
+  # ---- DATABASE LAYER (With Auto-Delete) ----
   CloudMentorTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete       
+    UpdateReplacePolicy: Delete  
     Properties:
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: userId
           AttributeType: S
-        - AttributeName: recordId # FIXED: Matched with app.mjs code logic
+        - AttributeName: recordId 
           AttributeType: S
       KeySchema:
         - AttributeName: userId
           KeyType: HASH
-        - AttributeName: recordId # FIXED: Matched with app.mjs code logic
+        - AttributeName: recordId 
           KeyType: RANGE
       SSESpecification:
         SSEEnabled: true
 
+  # ---- STORAGE LAYER (With Auto-Delete) ----
   CloudMentorMaterialsBucket:
     Type: AWS::S3::Bucket
+    DeletionPolicy: Delete       
+    UpdateReplacePolicy: Delete  
     Properties:
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
-      LifecycleConfiguration: # OPTIMIZATION: Auto-deletes temp classroom uploads after 1 day to save costs
-        Rules:
-          - Id: DeleteOldUploads
-            Status: Enabled
-            ExpirationInDays: 1
       CorsConfiguration:
         CorsRules:
           - AllowedHeaders:
@@ -194,11 +195,10 @@ Resources:
 
 Outputs:
   ApiBaseUrl:
-    Description: Base URL for the API Gateway HTTP API
     Value: !Sub 'https://${CloudMentorHttpApi}.execute-api.${AWS::Region}.amazonaws.com'
   TableName:
-    Description: DynamoDB table name
     Value: !Ref CloudMentorTable
   MaterialsBucketName:
-    Description: Private S3 bucket for uploaded CloudMentor study materials
     Value: !Ref CloudMentorMaterialsBucket
+  AmplifyAppProductionUrl:
+    Value: !GetAtt CloudMentorAmplifyBranch.DomainName
