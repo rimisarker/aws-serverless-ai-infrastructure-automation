@@ -37,7 +37,7 @@ jobs:
             --stack-name ${{ secrets.SAM_STACK_NAME }} \
             --resolve-s3 \
             --capabilities CAPABILITY_IAM \
-            --parameter-overrides AiMode=${{ secrets.AI_MODE }} OpenAiApiKey="${{ secrets.OPENAI_API_KEY }}"
+            --parameter-overrides "AiMode=${{ secrets.AI_MODE }} OpenAiApiKey=${{ secrets.OPENAI_API_KEY }}"
 
       # --- STEP 2: EXTRACT DYNAMIC CLOUDFORMATION OUTPUTS ---
       - name: Fetch Live Resource Parameters
