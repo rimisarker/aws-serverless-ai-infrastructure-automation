@@ -1,4 +1,4 @@
-name: Deploy CloudMentor Multi-Folder Infrastructure
+name: CloudMentor Production Automated Pipeline
 
 on:
   push:
@@ -6,29 +6,76 @@ on:
       - main
 
 jobs:
-  deploy:
+  deploy-infrastructure:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
 
-      - name: Setup AWS SAM CLI
-        uses: aws-actions/setup-sam@v2
+      - name: Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: SAM Build
-        run: sam build --template-file backend/template.yaml
+      - name: Setup AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
 
-      - name: SAM Deploy
+      # --- STEP 1: CONSTRUCT ALL AWS INFRASTRUCTURE VIA SAM ---
+      - name: Build AWS SAM Application
+        run: sam build
+
+      - name: Deploy AWS SAM Infrastructure Stack
         run: |
           sam deploy --no-confirm-changeset --no-fail-on-empty-changeset \
-            --stack-name CloudMentorAutomatedStack \
-            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --stack-name ${{ secrets.SAM_STACK_NAME }} \
             --resolve-s3 \
-            --parameter-overrides GitHubRepoUrl="https://github.com/${{ github.repository }}" GitHubBranch="main"
+            --capabilities CAPABILITY_IAM \
+            --parameter-overrides AiMode=${{ secrets.AI_MODE }} OpenAiApiKey="${{ secrets.OPENAI_API_KEY }}"
+
+      # --- STEP 2: EXTRACT DYNAMIC CLOUDFORMATION OUTPUTS ---
+      - name: Fetch Live Resource Parameters
+        id: fetch-outputs
+        run: |
+          API_URL=$(aws cloudformation describe-stacks --stack-name ${{ secrets.SAM_STACK_NAME }} --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text)
+          AMP_ID=$(aws cloudformation describe-stacks --stack-name ${{ secrets.SAM_STACK_NAME }} --query "Stacks[0].Outputs[?OutputKey=='AmplifyAppId'].OutputValue" --output text)
+          
+          echo "LIVE_API_URL=$API_URL" >> $GITHUB_ENV
+          echo "DYNAMIC_AMPLIFY_ID=$AMP_ID" >> $GITHUB_ENV
+          
+          echo "Target Backend API Base: $API_URL"
+          echo "Target Frontend Amplify App Target: $AMP_ID"
+
+      # --- STEP 3: BUILD PRODUCTION READY REACT CODEBASE ---
+      - name: Build Frontend Application
+        env:
+          VITE_API_BASE_URL: ${{ env.LIVE_API_URL }}
+        run: |
+          cd frontend
+          npm install
+          npm run build
+
+      # --- STEP 4: ZIP AND ATTACH FRONTEND STATIC DISTRIBUTION TO AMPLIFY ---
+      - name: Package Assets and Dispatch to AWS Amplify
+        run: |
+          cd frontend/dist
+          zip -r ../amplify-bundle.zip .
+          cd ..
+          
+          echo "Opening Deployment Token Stream with AWS Amplify..."
+          DEPLOY_STREAM=$(aws amplify create-deployment --app-id ${{ env.DYNAMIC_AMPLIFY_ID }} --branch-name main)
+          ZIP_UPLOAD_URL=$(echo $DEPLOY_STREAM | jq -r '.zipUploadUrl')
+          DEPLOY_JOB_ID=$(echo $DEPLOY_STREAM | jq -r '.jobId')
+          
+          echo "Streaming packaged zip artifact directly to AWS S3 Bucket..."
+          curl -H "Content-Type: application/zip" --upload-file amplify-bundle.zip "$ZIP_UPLOAD_URL"
+          
+          echo "Triggering Production Build Deployment Cycle for Job: $DEPLOY_JOB_ID"
+          aws amplify start-deployment --app-id ${{ env.DYNAMIC_AMPLIFY_ID }} --branch-name main --job-id $DEPLOY_JOB_ID
+          echo "Deployment pipeline executed successfully!"

@@ -1,0 +1,108 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: CloudMentor Full Serverless Architecture (Backend + Amplify FrontEnd IaC)
+
+Parameters:
+  AiMode:
+    Type: String
+    Default: 'mock'
+    AllowedValues: ['mock', 'openai']
+  OpenAiApiKey:
+    Type: String
+    NoEcho: true
+    Default: ''
+
+Resources:
+  # 1. DynamoDB Table for history and records
+  CloudMentorTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-data-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: recordId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: recordId
+          KeyType: RANGE
+
+  # 2. S3 Bucket for Study Materials
+  CloudMentorBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-materials-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # 3. API Gateway HTTP API
+  CloudMentorHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+
+  # 4. Lambda Monolith Function
+  CloudMentorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: src/app.handler
+      Runtime: nodejs22.x
+      Timeout: 29
+      MemorySize: 512
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref CloudMentorTable
+          MATERIALS_BUCKET: !Ref CloudMentorBucket
+          AI_MODE: !Ref AiMode
+          OPENAI_API_KEY: !Ref OpenAiApiKey
+          STORAGE_MODE: 's3'
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CloudMentorTable
+        - S3CrudPolicy:
+            BucketName: !Ref CloudMentorBucket
+      Events:
+        ProxyRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudMentorHttpApi
+            Path: /{proxy+}
+            Method: ANY
+
+  # 5. AWS Amplify Application (100% IaC Frontend Host)
+  CloudMentorAmplifyApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: !Sub ${AWS::StackName}-frontend
+      Description: Static React Web Hosting for CloudMentor Learning System
+
+  # 6. AWS Amplify Application Production Branch
+  CloudMentorAmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      AppId: !GetAtt CloudMentorAmplifyApp.AppId
+      BranchName: main
+
+Outputs:
+  ApiUrl:
+    Description: "Live Production API Gateway Endpoint URL"
+    Value: !Sub "https://${CloudMentorHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  AmplifyAppId:
+    Description: "Dynamically Generated AWS Amplify Application ID"
+    Value: !GetAtt CloudMentorAmplifyApp.AppId
